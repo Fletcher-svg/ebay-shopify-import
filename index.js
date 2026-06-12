@@ -1,9 +1,10 @@
-// axios - take page from eBay text HTML code
-const axios = require('axios');
-// cheerio - to photos from eBay, looking for an element in
-const cheerio = require('cheerio');
+require("dotenv").config();
+const axios = require("axios");
+// File System - create and save the CSV file to your hard drive.
+const fs = require("fs");
 
-const ebayId =
+
+const ebayId = 
 [
   "392877624101",
   "392877624103",
@@ -20,77 +21,157 @@ const ebayId =
   "392877641675",
   "392879571274",
   "392883796265",
-  "392883840156",
-  "392913557833"
+  "39288340156",
+  "392913557833",
 ];
 
-// function delay - helps to take breaks for eBay query
-const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-
-// fuction asynk (inside it will wait for answers from the service)
-async function getEbayImages(itemId)
+async function getEbayAccessToken() 
 {
-  const url = `https://www.ebay.com/itm/${itemId}`;
-// it's a secuiry if lose the internet or eBay falls
+  const clienId = process.env.EBAY_CLIENT_ID;
+  const clientSecret = process.env.EBAY_CLIENT_SECRET;
+
+// Checking fill in .env
+if (!clienId || !clientSecret)
+{
+  console.error("Error missing EBAY_CLIENT_ID or EBAY_CLIENT_SECRET in .env");
+  return null;
+}
+
+// Encryption method in Node.js for eBay
+const credentials = Buffer.from(`${clienId}:${clientSecret}`).toString('base64');
+
 try
 {
-  const response = await axios.get(url,
-    { headers:
-       { // the request is coming from chrome
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-    'Accept-Language': 'pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7',
-    'Cache-Control': 'no-cache',
-    'Pragma': 'no-cache'
-
-       }
-    });
-    // $ - can search for tags on the page
-    const $ = cheerio.load(response.data);
-    const imageUrls = [];
-    // searches for tag
-    const selectors = '.ux-image-filmstrip-carousal-item img, .image-container img, .vertical-filmstrip img';
-    // i - is the number of a picture. el - the tag in HTML
-    $(selectors).each((i, el) =>
+  // Send encrypted data
+  const response = await axios.post('https://api.ebay.com/identity/v1/oauth2/token', 
+      'grant_type=client_credentials&scope=https://api.ebay.com/oauth/api_scope',
     {
-      let src = $(el).attr('src') || $(el).attr('data-src');
-      // eBay - links lead to small images like (/s-l34.jpg). Use 1600 it give us the image in the highest resolution.  
-      if (src)
+      headers: 
       {
-        src = src.replace(/s-l\d+\./, 's-l1600.');
-        // Check if this photo is already in array
-        if (!imageUrls.includes(src) && src.startsWith('http'))
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Authorization': `Basic ${credentials}`
+      }
+    }
+  );
+
+  return response.data.access_token;
+  // If eBay rejects keys
+} catch (err)
+  {
+  console.error('Token generation failed:', err.response?.data || err.message);
+  return null;
+  }
+}
+
+// Request images through the Browse API
+async function getEbayImagesViaAPI(itemId, token) 
+{
+  // v1|itemId|0 is a strict requirement of eBay Browse API for product id
+  const url = `https://api.ebay.com/buy/browse/v1/item/v1|${itemId}|0`;
+
+  try
+  {
+    // Query to created address
+    const response = await axios.get(url,
+      {
+        headers:
         {
-          imageUrls.push(src);
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json'
         }
       }
-    });
-    return imageUrls;
+    );
 
-} catch (err)
- {
-  console.log(`Error parsing ID ${itemId}:`, err.message);
-  return [];
- }
+    const images = [];
+    const data = response.data;
+
+    // Check if there is a main picture in the answer
+    if (data.image?.imageUrl)
+    {
+      images.push(data.image.imageUrl);
+    }
+
+    // Check if the product has additional pictures 
+    if (Array.isArray(data.additionalImages))
+    {
+      data.additionalImages.forEach(img => 
+        {
+        if (img.imageUrl && !images.includes(img.imageUrl))
+        {
+          images.push(img.imageUrl);
+        }
+      });
+    }
+
+    return images;
+    // If product ID is not found
+  } catch(err)
+  {
+    const errMsg = err.response?.data?.errors?.[0]?.message || err.message;
+    console.error(`API error for ID ${itemId}`, errMsg);
+    return [];
+  }
 }
 
-// handles all id list
-async function run()
+// Build CSV for Shopify
+function saveToShopifyCSV(data)
 {
-  console.log(`Starting import for ${ebayId.length} items`);
+  let csvContent = "Handle,Title,Image Src,Image Position\n";
+
+  // Reviews the data collected for all goods.
+  data.forEach(item => {
+    if (item.images.length === 0)
+    {
+      csvContent += `${item.id},Product ${item.id},,\n`;
+      return;
+    }
+
+    item.images.forEach((imgUrl, idx) => {
+      // idx starts 0
+      const pos = idx + 1;
+
+      // Shopify request
+      if (idx === 0)
+      {
+        csvContent += `${item.id},Product ${item.id},"${imgUrl}",${pos}\n`;
+      } else
+      {
+        csvContent += `${item.id},,"${imgUrl}",${pos}\n`;
+      }
+    });
+  });
+
+  // Wtite it into the file
+  fs.writeFileSync('shopify_import.csv', csvContent, 'utf8');
+  console.log('CSV report generated shopify_import.csv');
+}
+
+// Entry point
+async function run() 
+{
+  console.log('Starting eBay API scraper');
+  
+  const token = await getEbayAccessToken();
+  if (!token)
+  {
+    console.error('Process aborted auth failed');
+    return;
+  }
+
   const result = [];
-  // cycle
+
+  // Send each ID to the API
   for (const id of ebayId)
   {
-    // create object
-    console.log(`Processing ID: ${id}`);
-    const images = await getEbayImages(id);
-    console.log(`Found ${images.length} images`);
-    result.push({id, images});
-    await delay(1500);
-  }
-  console.log('Done! All items processed')
-  return result;
-}
-run(); 
+    console.log(`Fetching ID: ${id} `);
+    const images = await getEbayImagesViaAPI(id, token);
 
+    console.log(`-> Found ${images.length} images.`);
+    result.push({id, images});
+  }
+
+  console.log('All data from eBay API fetched successfully');
+  saveToShopifyCSV(result);
+}
+
+run();
