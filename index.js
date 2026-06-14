@@ -1,44 +1,68 @@
 require("dotenv").config();
 const axios = require("axios");
-// File System - create and save the CSV file to your hard drive.
+// File System - create and save the CSV file to your hard drive
 const fs = require("fs");
+// csv-parser - converts table rows to objects
+const csv = require('csv-parser');
 
+const INPUT_CSV_FILE = 'eBay-all-active-listings-report-2026-04-21-11301581787.csv';
+const OUTPUT_CSV_FILE = 'shopify_import.csv';
 
-const ebayId = 
-[
-  "392877624101",
-  "392877624103",
-  "392877624104",
-  "392877624106",
-  "392877624108",
-  "392877624113",
-  "392877629804",
-  "392877630797",
-  "392877631633",
-  "392877633610",
-  "392877637944",
-  "392877640790",
-  "392877641675",
-  "392879571274",
-  "392883796265",
-  "39288340156",
-  "392913557833",
-];
+const TEST_MODE = true;
+const TEST_LIMIT = 5;
+
+function parseEbayCsv(filePath)
+{
+  // Promis is needed that the program knows when the reading will be finished or bad 
+  return new Promise((resolve, reject) => {
+    const ids = [];
+    // The file physically exists in the specified path
+    if (!fs.existsSync(filePath))
+    {
+      return reject(new Error(`Input file missing: ${filePath}`));
+    }
+    // Starts streaming the file from the disk in parts
+    fs.createReadStream(filePath)
+       // Redirects the read flow to a csv-parser
+      .pipe(csv({ 
+        separator: ';',
+        mapHeaders: ({ header }) => header.replace(/^\uFEFF/, '').trim()
+      }))
+      // The processes a row from a table
+      .on('data', (row) => {
+        const rawId = row['Item number'];
+        if (rawId)
+        {
+          //Removes random invisible spaces or row transfer characters
+          const cleanId = rawId.trim();
+          if(cleanId) ids.push(cleanId);
+        }
+      })
+      // Listener event, when the file is read to the end
+      .on('end', () => 
+      {
+        console.log(`Parsed input CSV total ID found: ${ids.length}`);
+        // Completes Promis and returns a pre-populated ID array
+        resolve(ids);
+      })
+      .on('error', reject);
+  });  
+}
 
 async function getEbayAccessToken() 
 {
-  const clienId = process.env.EBAY_CLIENT_ID;
+  const clientId = process.env.EBAY_CLIENT_ID;
   const clientSecret = process.env.EBAY_CLIENT_SECRET;
 
 // Checking fill in .env
-if (!clienId || !clientSecret)
+if (!clientId || !clientSecret)
 {
-  console.error("Error missing EBAY_CLIENT_ID or EBAY_CLIENT_SECRET in .env");
-  return null;
+  // Force stop the script
+  throw new Error('Error missing EBAY_CLIENT_ID or EBAY_CLIENT_SECRET in .env');
 }
 
 // Encryption method in Node.js for eBay
-const credentials = Buffer.from(`${clienId}:${clientSecret}`).toString('base64');
+const credentials = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
 
 try
 {
@@ -59,7 +83,7 @@ try
 } catch (err)
   {
   console.error('Token generation failed:', err.response?.data || err.message);
-  return null;
+  throw err;
   }
 }
 
@@ -118,60 +142,60 @@ function saveToShopifyCSV(data)
 {
   let csvContent = "Handle,Title,Image Src,Image Position\n";
 
-  // Reviews the data collected for all goods.
+  // Reviews the data collected for all goods
   data.forEach(item => {
     if (item.images.length === 0)
     {
-      csvContent += `${item.id},Product ${item.id},,\n`;
+      csvContent += `${item.id},,,\n`;
       return;
     }
-
-    item.images.forEach((imgUrl, idx) => {
-      // idx starts 0
-      const pos = idx + 1;
-
-      // Shopify request
-      if (idx === 0)
-      {
-        csvContent += `${item.id},Product ${item.id},"${imgUrl}",${pos}\n`;
-      } else
-      {
-        csvContent += `${item.id},,"${imgUrl}",${pos}\n`;
-      }
+    // Shopify import images
+    item.images.forEach((url, idx) => {
+      // idx starts with 0
+      const title = idx === 0 ? `Product ${item.id}` : '';
+      csvContent += `${item.id},"${title}","${url}",${idx + 1}\n`;
     });
   });
 
   // Wtite it into the file
-  fs.writeFileSync('shopify_import.csv', csvContent, 'utf8');
-  console.log('CSV report generated shopify_import.csv');
+  fs.writeFileSync(OUTPUT_CSV_FILE, csvContent, 'utf8');
+  console.log(`Import Shopify saved to ${OUTPUT_CSV_FILE}`);
 }
 
 // Entry point
 async function run() 
 {
-  console.log('Starting eBay API scraper');
-  
-  const token = await getEbayAccessToken();
-  if (!token)
+  console.log('Starting sync process');
+
+  try
   {
-    console.error('Process aborted auth failed');
-    return;
-  }
+    // Parsing CSV report
+    let ebayIds = await parseEbayCsv(INPUT_CSV_FILE);
 
-  const result = [];
+    if (TEST_MODE)
+    {
+      console.log(`Test mode limiting to first ${TEST_LIMIT} items.`);
+      ebayIds = ebayIds.slice(0, TEST_LIMIT);
+    }
 
-  // Send each ID to the API
-  for (const id of ebayId)
+    const token = await getEbayAccessToken();
+    console.log('OAuth token generated successfully');
+
+    const result = []
+    // EbayIds starts to read each ID one at a time
+    for (const id of ebayIds)
+    {
+      console.log(`Processing item: ${id}`);
+      const images = await getEbayImagesViaAPI(id, token);
+      console.log(`Found ${images.length} images`);
+      result.push({id, images});
+    }
+    saveToShopifyCSV(result);
+    console.log('Sync finished seccessfully');
+  } catch (err)
   {
-    console.log(`Fetching ID: ${id} `);
-    const images = await getEbayImagesViaAPI(id, token);
-
-    console.log(`-> Found ${images.length} images.`);
-    result.push({id, images});
+    console.error('Critical process error:', err.message);
   }
-
-  console.log('All data from eBay API fetched successfully');
-  saveToShopifyCSV(result);
 }
 
 run();
