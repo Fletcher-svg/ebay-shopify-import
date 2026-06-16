@@ -15,6 +15,32 @@ const TEST_LIMIT_ITEMS = 800;
 // Delay
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+function convertToSlug(text)
+{
+  if(!text) return "";
+
+  let slug = text.toString().toLowerCase().trim();
+  // Map for German and Polish characters 
+  const mapping =
+  {
+    'ä': 'ae', 'ö': 'oe', 'ü': 'ue', 'ß': 'ss',
+    'ą': 'a', 'ć': 'c', 'ę': 'e', 'ł': 'l', 'ń': 'n', 'ó': 'o', 'ś': 's', 'ź': 'z', 'ż': 'z'
+  };
+
+  for (const [key, value] of Object.entries(mapping))
+  {
+    slug = slug.split(key).join(value);
+  }
+
+  return slug
+  // Remove special characters
+  .replace(/[^a-z0-9 -]/g, "")
+  // Replace spaces
+  .replace(/\s+/g, "-")
+  // Collapse multiple consecutive 
+  .replace(/-+/g, "-")
+}
+
 // Read the file
 function parseEbayCsv(filePath) 
 {
@@ -22,7 +48,10 @@ function parseEbayCsv(filePath)
   return new Promise((resolve, reject) => 
     {
     // Avoid duplicate ID
-    const idSet = new Set(); // set - it cannot physically store duplicates
+    // const idSet = new Set(); 
+
+    const productMap = {};
+    const idOrder = [];
 
     // The file physically exists in the specified path
     if (!fs.existsSync(filePath)) 
@@ -47,16 +76,27 @@ function parseEbayCsv(filePath)
           const cleanId = rawId.trim();
           if (cleanId && !isNaN(cleanId)) 
           {
-            idSet.add(cleanId);
+            
+            if (!productMap[cleanId])
+            {
+              idOrder.push(cleanId);
+              productMap[cleanId] = 
+              {
+                id: cleanId,
+                title: row["Title"] ? row["Title"].trim() : `Product ${cleanId}`,
+                price: row["Start price"] ? row["Start price"].trim() : "0.00",
+                description: row["Title"] ? row["Title"].trim() : `Product ${cleanId}`
+              };
+            }
           }
         }
       })
        // Listener event, when the file is read to the end
       .on("end", () => 
       {
-        console.log(`Parsed input CSV total unique ID found: ${idSet.size}`);
+        console.log(`Parsed input CSV total unique ID found: ${idOrder.length}`);
         // Returns Set to a regular array 
-        resolve(Array.from(idSet));
+        resolve({ idOrder, productMap });
       })
       .on("error", reject);
   });
@@ -135,24 +175,31 @@ async function getEbayImagesViaAPI(itemId, token)
   }
 }
 
-function generateShopifyCSV(ebayIds, imagesMap, limit) 
+function generateShopifyCSV(ebayIds, productMap, imagesMap, limit) 
 {
   // Header 
-  let csvContent = "Handle,Title,Image Src,Image Position\n";
+  let csvContent = "Handle,Title,Body (HTML),Variant Price,Image Src,Image Position\n";
   // Limit
   const itemsToProcess = ebayIds.slice(0, limit);
 
   itemsToProcess.forEach((id) => 
     {
+      const prod = productMap[id];
+      // Generate structural URL handle directly from title string
+      const mainHandle = convertToSlug(prod.title);
+
     // Checks if we have a cache for this ID in  map
     const images = imagesMap[id] && imagesMap[id].length > 0 
       ? imagesMap[id] 
       : [`https://thumbs.ebaystatic.com/images/g/O~0AAOSw~-~${id}/s-l1600.jpg`];
 
     images.forEach((url, idx) => 
-    { // Shopify import structures for grouping images under a single product.
-      const title = idx === 0 ? `Product ${id}` : "";
-      csvContent += `${id},"${title}","${url}",${idx + 1}\n`;
+    { if (idx === 0) 
+      {
+        // Master rows container setup combining handle parameters alongside meta content
+        csvContent += `"${mainHandle}","${prod.title.replace(/"/g, '""')}","${prod.description.replace(/"/g, '""')}","${prod.price}","${url}",${idx + 1}\n`;      } else {
+        // Child gallery container appending links back to predefined master rows using the assigned handle
+        csvContent += `"${mainHandle}","","","","${url}",${idx + 1}\n`;      }
     });
   });
 
@@ -170,7 +217,7 @@ async function run()
   console.log("Starting sync process");
   try {
     // Wait for it to finish and retains the cleaned ID array
-    const ebayIds = await parseEbayCsv(INPUT_CSV_FILE);
+    const { idOrder, productMap } = await parseEbayCsv(INPUT_CSV_FILE);
     // the key-value structure (where the key is the ID of the item and the value is the mass of its image)
     let imagesMap = {};
 
@@ -187,12 +234,12 @@ async function run()
       console.log("OAuth token generated successfully. Starting loop...");
 
       // Only charge what we need (Limit)
-      const maxToFetch = Math.min(ebayIds.length, TEST_LIMIT_ITEMS);
+      const maxToFetch = Math.min(idOrder.length, TEST_LIMIT_ITEMS);
 
       for (let i = 0; i < maxToFetch; i++) 
       {
         // Get the ID of the current product by index 
-        const id = ebayIds[i];
+        const id = idOrder[i];
         // Progress bar in the console
         console.log(`Processing item ${i + 1}/${maxToFetch}: ${id}`);
         // Send a request to the eBay API
@@ -212,7 +259,7 @@ async function run()
     }
 
     // Generate the target CSV file
-    generateShopifyCSV(ebayIds, imagesMap, TEST_LIMIT_ITEMS);
+    generateShopifyCSV(idOrder, productMap, imagesMap, TEST_LIMIT_ITEMS);
 
   } catch (err) {
     console.error("Critical process error:", err.message);
